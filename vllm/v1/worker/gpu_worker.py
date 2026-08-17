@@ -407,7 +407,14 @@ class Worker(WorkerBase):
         init_workspace_manager(self.device, num_ubatches)
 
         # Construct the model runner
-        if self.use_v2_model_runner:
+        tapid_config = self.vllm_config.additional_config.get("tapid")
+        if tapid_config is not None:
+            if self.use_v2_model_runner:
+                raise ValueError("TAPID requires the V1 model runner")
+            from vllm.v1.worker.tapid_model_runner import TapidGPUModelRunner
+
+            self.model_runner = TapidGPUModelRunner(self.vllm_config, self.device)
+        elif self.use_v2_model_runner:
             from vllm.v1.worker.gpu.model_runner import (
                 GPUModelRunner as GPUModelRunnerV2,
             )
