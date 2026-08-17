@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+from enum import Enum, auto
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -19,20 +20,49 @@ class TapidConfigError(RuntimeError):
     pass
 
 
+class WeightRole(Enum):
+    NORM_SCALE = auto()
+    MLP_NORM_SCALE = auto()
+    GDN_NORM_SCALE = auto()
+    GDN_INPUT_QKVZ = auto()
+    GDN_INPUT_BA = auto()
+    GDN_CONV = auto()
+    GDN_A_LOG = auto()
+    GDN_DT_BIAS = auto()
+    GDN_GATE_NORM = auto()
+    GDN_OUT = auto()
+    ATTN_Q = auto()
+    ATTN_K = auto()
+    ATTN_V = auto()
+    ATTN_O = auto()
+    ATTN_Q_NORM = auto()
+    ATTN_K_NORM = auto()
+    MLP_GATE = auto()
+    MLP_UP = auto()
+    MLP_DOWN = auto()
+    FINAL_NORM = auto()
+
+
+@dataclass(frozen=True)
+class WeightBinding:
+    layer: int | None
+    role: WeightRole
+    tensor: torch.Tensor
+
+
 @dataclass(frozen=True)
 class RuntimeBindings:
     attention_kv: dict[str, torch.Tensor]
     gdn_conv: dict[str, torch.Tensor]
     gdn_recurrent: dict[str, torch.Tensor]
     block_size: int
-    hidden_size: int
 
 
 @dataclass(frozen=True)
 class PrefillStep:
     num_tokens: int
     num_requests: int
-    input_ids: torch.Tensor
+    hidden_input: torch.Tensor
     positions: torch.Tensor
     query_start_loc: torch.Tensor
     num_computed_tokens: torch.Tensor
@@ -51,6 +81,7 @@ class FakeSession:
         self.bindings = None
         self.workspace = None
         self.last_step = None
+        self.last_stream = None
 
     def bind_weights(self, weights):
         self.weights = weights
@@ -65,8 +96,9 @@ class FakeSession:
     def start(self):
         self.ready = True
 
-    def run(self, step):
+    def run_prefill(self, step, *, stream=None):
         self.last_step = step
+        self.last_stream = stream
         return step.hidden_output[: step.num_tokens]
 
     def close(self):
@@ -77,6 +109,8 @@ class FakeSession:
 
 FAKE_TAPID = SimpleNamespace(
     Session=FakeSession,
+    WeightRole=WeightRole,
+    WeightBinding=WeightBinding,
     RuntimeBindings=RuntimeBindings,
     PrefillStep=PrefillStep,
     TapidConfigError=TapidConfigError,
@@ -91,6 +125,7 @@ def test_tapid_runner_validates_model_signature():
             kv_connector="NixlConnector",
             kv_role="kv_producer",
         ),
+        quant_config=None,
     )
     runner.model_config = SimpleNamespace(
         enforce_eager=True,
@@ -104,6 +139,7 @@ def test_tapid_runner_validates_model_signature():
     )
     runner.speculative_config = None
     runner.lora_config = None
+    runner.scheduler_config = SimpleNamespace(async_scheduling=False)
 
     runner._validate_config()
     runner.vllm_config.additional_config["tapid"]["model_signature"] = "unknown"
@@ -127,6 +163,68 @@ def test_qwen_layer_names_require_27b_layout():
     layers.pop("model.layers.0.linear_attn")
     with pytest.raises(ValueError, match="48 GDN"):
         tapid_qwen_module.get_qwen_layer_names(config)
+
+
+def test_qwen_weight_bindings_use_loaded_packed_views():
+    def linear(weight):
+        return SimpleNamespace(weight=weight)
+
+    def norm(size):
+        return SimpleNamespace(weight=torch.empty(size))
+
+    def mlp():
+        return SimpleNamespace(
+            gate_up_proj=linear(torch.arange(24).reshape(6, 4)),
+            down_proj=linear(torch.empty(4, 3)),
+        )
+
+    gdn_qkvz = torch.empty(8, 4)
+    gdn = SimpleNamespace(
+        layer_type="linear_attention",
+        input_layernorm=norm(4),
+        post_attention_layernorm=norm(4),
+        mlp=mlp(),
+        linear_attn=SimpleNamespace(
+            in_proj_qkvz=linear(gdn_qkvz),
+            in_proj_ba=linear(torch.empty(2, 4)),
+            conv1d=linear(torch.empty(6, 1, 4)),
+            A_log=torch.empty(2),
+            dt_bias=torch.empty(2),
+            norm=norm(2),
+            out_proj=linear(torch.empty(4, 3)),
+        ),
+    )
+    packed_qkv = torch.arange(24).reshape(6, 4)
+    attention = SimpleNamespace(
+        layer_type="full_attention",
+        input_layernorm=norm(4),
+        post_attention_layernorm=norm(4),
+        mlp=mlp(),
+        self_attn=SimpleNamespace(
+            q_size=2,
+            kv_size=1,
+            qkv_proj=linear(packed_qkv),
+            o_proj=linear(torch.empty(4, 2)),
+            q_norm=norm(2),
+            k_norm=norm(1),
+        ),
+    )
+    final_norm = norm(4)
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=(gdn, attention), norm=final_norm)
+    )
+
+    bindings = tapid_qwen_module.build_weight_bindings(model, FAKE_TAPID)
+    mapped = {(item.layer, item.role): item.tensor for item in bindings}
+
+    assert len(bindings) == 24
+    assert mapped[(0, WeightRole.GDN_INPUT_QKVZ)] is gdn_qkvz
+    assert mapped[(0, WeightRole.GDN_CONV)].shape == (6, 4)
+    assert mapped[(0, WeightRole.MLP_GATE)].shape == (3, 4)
+    assert mapped[(1, WeightRole.ATTN_Q)].data_ptr() == packed_qkv.data_ptr()
+    assert mapped[(1, WeightRole.ATTN_K)].shape == (1, 4)
+    assert mapped[(1, WeightRole.MLP_UP)].shape == (3, 4)
+    assert mapped[(None, WeightRole.FINAL_NORM)] is final_norm.weight
 
 
 def test_qwen_runtime_and_prefill_bindings(monkeypatch: pytest.MonkeyPatch):
@@ -156,7 +254,7 @@ def test_qwen_runtime_and_prefill_bindings(monkeypatch: pytest.MonkeyPatch):
     assert bindings.gdn_conv["model.layers.0.linear_attn"] is conv_state
     assert bindings.gdn_recurrent["model.layers.0.linear_attn"] is recurrent_state
 
-    input_ids = torch.tensor([11, 12, 13], dtype=torch.int32)
+    hidden_input = torch.empty(3, 5120, dtype=torch.bfloat16)
     positions = torch.tensor([5, 6, 7], dtype=torch.int64)
     query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
     num_computed_tokens = torch.tensor([5, 7], dtype=torch.int32)
@@ -191,7 +289,7 @@ def test_qwen_runtime_and_prefill_bindings(monkeypatch: pytest.MonkeyPatch):
         FAKE_TAPID,
         "attention",
         "gdn",
-        input_ids,
+        hidden_input,
         positions,
     )
     assert step.num_tokens == 3
@@ -206,7 +304,7 @@ def test_qwen_runtime_and_prefill_bindings(monkeypatch: pytest.MonkeyPatch):
             FAKE_TAPID,
             "attention",
             "gdn",
-            input_ids,
+            hidden_input,
             positions,
         )
 
@@ -220,7 +318,8 @@ def test_tapid_runner_lifecycle_uses_session():
     runner.tapid_attention_layers = ()
     runner.tapid_gdn_layers = ()
     runner.device = torch.device("cpu")
-    runner.model = torch.nn.Linear(2, 2, bias=False)
+    hidden_input = torch.empty(1, 4, dtype=torch.bfloat16)
+    runner.model = SimpleNamespace(embed_input_ids=lambda _: hidden_input)
     runner.scheduler_config = SimpleNamespace(
         max_num_batched_tokens=8,
         max_num_seqs=2,
@@ -230,6 +329,7 @@ def test_tapid_runner_lifecycle_uses_session():
         get_hidden_size=lambda: 4,
     )
     runner.vllm_config = SimpleNamespace()
+    weight_bindings = [object()]
 
     with (
         patch.object(GPUModelRunner, "load_model"),
@@ -238,16 +338,21 @@ def test_tapid_runner_lifecycle_uses_session():
             "get_qwen_layer_names",
             return_value=(("attention",), ("gdn",)),
         ),
+        patch.object(
+            tapid_runner_module,
+            "build_weight_bindings",
+            return_value=weight_bindings,
+        ),
     ):
         runner.load_model()
 
     session = runner.tapid_session
     assert session is not None
     assert session.workspace == (8, 2)
-    assert session.weights["weight"] is runner.model.weight
+    assert session.weights is weight_bindings
     assert runner.tapid_hidden_output.shape == (8, 4)
 
-    bindings = RuntimeBindings({}, {}, {}, 16, 4)
+    bindings = RuntimeBindings({}, {}, {}, 16)
     with (
         patch.object(GPUModelRunner, "initialize_kv_cache"),
         patch.object(
@@ -263,7 +368,7 @@ def test_tapid_runner_lifecycle_uses_session():
     step = PrefillStep(
         num_tokens=1,
         num_requests=1,
-        input_ids=torch.tensor([1], dtype=torch.int32),
+        hidden_input=hidden_input,
         positions=torch.tensor([0], dtype=torch.int64),
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         num_computed_tokens=torch.tensor([0], dtype=torch.int32),
@@ -272,14 +377,22 @@ def test_tapid_runner_lifecycle_uses_session():
         attention_slot_mapping=torch.tensor([0], dtype=torch.int64),
         gdn_state_indices=torch.tensor([1], dtype=torch.int32),
     )
-    with patch.object(
-        tapid_runner_module,
-        "build_prefill_step",
-        return_value=step,
+    stream = object()
+    with (
+        patch.object(
+            tapid_runner_module,
+            "build_prefill_step",
+            return_value=step,
+        ) as build_step,
+        patch.object(torch.cuda, "current_stream", return_value=stream),
     ):
-        output = runner._model_forward(step.input_ids, step.positions)
+        output = runner._model_forward(
+            torch.tensor([1], dtype=torch.int32), step.positions
+        )
     assert output.data_ptr() == runner.tapid_hidden_output.data_ptr()
+    assert build_step.call_args.args[-2] is hidden_input
     assert session.last_step is step
+    assert session.last_stream is stream
 
     with patch.object(GPUModelRunner, "shutdown"):
         runner.shutdown()

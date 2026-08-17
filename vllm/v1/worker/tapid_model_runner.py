@@ -13,6 +13,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.tapid_qwen3_5 import (
     build_prefill_step,
     build_runtime_bindings,
+    build_weight_bindings,
     get_qwen_layer_names,
 )
 
@@ -54,6 +55,10 @@ class TapidGPUModelRunner(GPUModelRunner):
             raise ValueError("TAPID P0/P1 does not support spec decode or LoRA")
         if self.parallel_config.enable_dbo:
             raise ValueError("TAPID P0/P1 does not support DBO")
+        if self.vllm_config.quant_config is not None:
+            raise ValueError("TAPID P0/P1 does not support quantization")
+        if self.scheduler_config.async_scheduling:
+            raise ValueError("TAPID P0/P1 does not support async scheduling")
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)
@@ -64,7 +69,7 @@ class TapidGPUModelRunner(GPUModelRunner):
             device=self.device.index,
             model_signature=self.tapid_config["model_signature"],
         )
-        self.tapid_session.bind_weights(dict(self.model.named_parameters()))
+        self.tapid_session.bind_weights(build_weight_bindings(self.model, self.tapid))
         self.tapid_session.reserve_workspace(
             max_num_tokens=self.scheduler_config.max_num_batched_tokens,
             max_num_requests=self.scheduler_config.max_num_seqs,
@@ -108,9 +113,15 @@ class TapidGPUModelRunner(GPUModelRunner):
             raise self.tapid.TapidConfigError(
                 "TAPID session is not ready for online forward"
             )
-        if input_ids is None or positions is None:
+        if positions is None:
+            raise self.tapid.TapidConfigError("TAPID P0/P1 requires positions")
+        if inputs_embeds is not None:
+            hidden_input = inputs_embeds
+        elif input_ids is not None:
+            hidden_input = self.model.embed_input_ids(input_ids)
+        else:
             raise self.tapid.TapidConfigError(
-                "TAPID P0/P1 requires token IDs and positions"
+                "TAPID P0/P1 requires token IDs or input embeddings"
             )
 
         step = build_prefill_step(
@@ -118,10 +129,11 @@ class TapidGPUModelRunner(GPUModelRunner):
             self.tapid,
             self.tapid_attention_layers[0],
             self.tapid_gdn_layers[0],
-            input_ids,
+            hidden_input,
             positions,
         )
-        return self.tapid_session.run(step)
+        stream = torch.cuda.current_stream(self.device)
+        return self.tapid_session.run_prefill(step, stream=stream)
 
     def shutdown(self) -> None:
         if self.tapid_session is not None:
