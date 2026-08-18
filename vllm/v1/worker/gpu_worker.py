@@ -410,10 +410,15 @@ class Worker(WorkerBase):
         tapid_config = self.vllm_config.additional_config.get("tapid")
         if tapid_config is not None:
             if self.use_v2_model_runner:
-                raise ValueError("TAPID requires the V1 model runner")
-            from vllm.v1.worker.tapid_model_runner import TapidGPUModelRunner
+                from vllm.v1.worker.tapid_model_runner import TapidGPUModelRunnerV2
 
-            self.model_runner = TapidGPUModelRunner(self.vllm_config, self.device)
+                self.model_runner = TapidGPUModelRunnerV2(
+                    self.vllm_config, self.device
+                )
+            else:
+                from vllm.v1.worker.tapid_model_runner import TapidGPUModelRunner
+
+                self.model_runner = TapidGPUModelRunner(self.vllm_config, self.device)
         elif self.use_v2_model_runner:
             from vllm.v1.worker.gpu.model_runner import (
                 GPUModelRunner as GPUModelRunnerV2,
@@ -845,6 +850,11 @@ class Worker(WorkerBase):
             mode=self.observability_config.jit_monitor_mode,
             verbose=self.observability_config.jit_monitor_verbose,
         )
+
+        # TAPID's persistent kernels deadlock every device-wide sync, and warmup
+        # is full of them. Keep warmup on the vLLM model and arm TAPID here.
+        if hasattr(self.model_runner, "tapid_arm"):
+            self.model_runner.tapid_arm()
 
         # Freeze the worker heap so the GC won't scan static objects
         # (model weights, KV caches, CUDA graphs) during inference.
