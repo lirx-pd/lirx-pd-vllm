@@ -107,6 +107,14 @@ class FakeSession:
         self.bindings = None
 
 
+class FakeStream:
+    def __init__(self):
+        self.synchronized = False
+
+    def synchronize(self):
+        self.synchronized = True
+
+
 FAKE_TAPID = SimpleNamespace(
     Session=FakeSession,
     WeightRole=WeightRole,
@@ -145,6 +153,30 @@ def test_tapid_runner_validates_model_signature():
     runner.vllm_config.additional_config["tapid"]["model_signature"] = "unknown"
     with pytest.raises(ValueError, match="signature"):
         runner._validate_config()
+
+
+def test_tapid_runner_allows_kv_transfer_to_be_disabled():
+    runner = TapidGPUModelRunner.__new__(TapidGPUModelRunner)
+    runner.vllm_config = SimpleNamespace(
+        additional_config={"tapid": {"model_signature": "qwen3_5_dense_27b_bf16"}},
+        kv_transfer_config=None,
+        quant_config=None,
+    )
+    runner.model_config = SimpleNamespace(
+        enforce_eager=True,
+        hf_text_config=SimpleNamespace(model_type="qwen3_5_text"),
+        dtype=torch.bfloat16,
+    )
+    runner.parallel_config = SimpleNamespace(
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        enable_dbo=False,
+    )
+    runner.speculative_config = None
+    runner.lora_config = None
+    runner.scheduler_config = SimpleNamespace(async_scheduling=False)
+
+    runner._validate_config()
 
 
 def test_qwen_layer_names_require_27b_layout():
@@ -203,6 +235,8 @@ def test_qwen_weight_bindings_use_loaded_packed_views():
         self_attn=SimpleNamespace(
             q_size=2,
             kv_size=1,
+            num_heads=2,
+            head_dim=1,
             qkv_proj=linear(packed_qkv),
             o_proj=linear(torch.empty(4, 2)),
             q_norm=norm(2),
@@ -211,7 +245,9 @@ def test_qwen_weight_bindings_use_loaded_packed_views():
     )
     final_norm = norm(4)
     model = SimpleNamespace(
-        model=SimpleNamespace(layers=(gdn, attention), norm=final_norm)
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(layers=(gdn, attention), norm=final_norm)
+        )
     )
 
     bindings = tapid_qwen_module.build_weight_bindings(model, FAKE_TAPID)
@@ -221,10 +257,16 @@ def test_qwen_weight_bindings_use_loaded_packed_views():
     assert mapped[(0, WeightRole.GDN_INPUT_QKVZ)] is gdn_qkvz
     assert mapped[(0, WeightRole.GDN_CONV)].shape == (6, 4)
     assert mapped[(0, WeightRole.MLP_GATE)].shape == (3, 4)
-    assert mapped[(1, WeightRole.ATTN_Q)].data_ptr() == packed_qkv.data_ptr()
+    assert torch.equal(
+        mapped[(1, WeightRole.ATTN_Q)],
+        packed_qkv[:4][[0, 2, 1, 3]],
+    )
     assert mapped[(1, WeightRole.ATTN_K)].shape == (1, 4)
     assert mapped[(1, WeightRole.MLP_UP)].shape == (3, 4)
-    assert mapped[(None, WeightRole.FINAL_NORM)] is final_norm.weight
+    assert torch.equal(
+        mapped[(None, WeightRole.FINAL_NORM)],
+        final_norm.weight + 1,
+    )
 
 
 def test_qwen_runtime_and_prefill_bindings(monkeypatch: pytest.MonkeyPatch):
@@ -254,11 +296,11 @@ def test_qwen_runtime_and_prefill_bindings(monkeypatch: pytest.MonkeyPatch):
     assert bindings.gdn_conv["model.layers.0.linear_attn"] is conv_state
     assert bindings.gdn_recurrent["model.layers.0.linear_attn"] is recurrent_state
 
-    hidden_input = torch.empty(3, 5120, dtype=torch.bfloat16)
+    hidden_input = torch.empty(3, 5120, dtype=torch.float32)
     positions = torch.tensor([5, 6, 7], dtype=torch.int64)
     query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
     num_computed_tokens = torch.tensor([5, 7], dtype=torch.int32)
-    hidden_output = torch.empty(8, 5120, dtype=torch.bfloat16)
+    hidden_output = torch.empty(8, 5120, dtype=torch.float32)
     block_table = torch.tensor([[2], [3]], dtype=torch.int32)
     slot_mapping = torch.tensor([33, 34, 48], dtype=torch.int64)
     state_indices = torch.tensor([4, 5], dtype=torch.int32)
@@ -315,6 +357,7 @@ def test_tapid_runner_lifecycle_uses_session():
     runner.tapid_config = {"model_signature": "qwen3_5_dense_27b_bf16"}
     runner.tapid_session = None
     runner.tapid_hidden_output = None
+    runner.tapid_weight_bindings = []
     runner.tapid_attention_layers = ()
     runner.tapid_gdn_layers = ()
     runner.device = torch.device("cpu")
@@ -362,7 +405,7 @@ def test_tapid_runner_lifecycle_uses_session():
         ),
     ):
         runner.initialize_kv_cache(SimpleNamespace())
-    assert session.ready
+    assert not session.ready
     assert session.bindings is bindings
 
     step = PrefillStep(
@@ -377,7 +420,7 @@ def test_tapid_runner_lifecycle_uses_session():
         attention_slot_mapping=torch.tensor([0], dtype=torch.int64),
         gdn_state_indices=torch.tensor([1], dtype=torch.int32),
     )
-    stream = object()
+    stream = FakeStream()
     with (
         patch.object(
             tapid_runner_module,
@@ -387,12 +430,16 @@ def test_tapid_runner_lifecycle_uses_session():
         patch.object(torch.cuda, "current_stream", return_value=stream),
     ):
         output = runner._model_forward(
-            torch.tensor([1], dtype=torch.int32), step.positions
+            torch.tensor([1], dtype=torch.int32), step.positions.repeat(3, 1)
         )
-    assert output.data_ptr() == runner.tapid_hidden_output.data_ptr()
-    assert build_step.call_args.args[-2] is hidden_input
+    assert output.dtype == torch.bfloat16
+    assert output.shape == (1, 4)
+    assert build_step.call_args.args[-2].dtype == torch.float32
     assert session.last_step is step
     assert session.last_stream is stream
+    assert stream.synchronized
+    assert runner.tapid_session is None
+    assert build_step.call_args.args[-1].shape == (1,)
 
     with patch.object(GPUModelRunner, "shutdown"):
         runner.shutdown()

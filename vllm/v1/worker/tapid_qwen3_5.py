@@ -25,7 +25,8 @@ def get_qwen_layer_names(
 
 
 def build_weight_bindings(model: Any, tapid: Any) -> list[Any]:
-    text_model = model.model
+    causal_lm = model.language_model if hasattr(model, "language_model") else model
+    text_model = causal_lm.model
     bindings = []
 
     def bind(layer: int | None, role: str, tensor: torch.Tensor) -> None:
@@ -37,12 +38,27 @@ def build_weight_bindings(model: Any, tapid: Any) -> list[Any]:
             )
         )
 
+    def qwen_rms_scale(weight: torch.Tensor) -> torch.Tensor:
+        return (weight.float() + 1.0).to(weight.dtype).contiguous()
+
     for layer_idx, layer in enumerate(text_model.layers):
         if layer.layer_type == "linear_attention":
             mixer = layer.linear_attn
-            bind(layer_idx, "GDN_NORM_SCALE", layer.input_layernorm.weight)
-            bind(layer_idx, "GDN_INPUT_QKVZ", mixer.in_proj_qkvz.weight)
-            bind(layer_idx, "GDN_INPUT_BA", mixer.in_proj_ba.weight)
+            bind(
+                layer_idx,
+                "GDN_NORM_SCALE",
+                qwen_rms_scale(layer.input_layernorm.weight),
+            )
+            bind(
+                layer_idx,
+                "GDN_INPUT_QKVZ",
+                mixer.in_proj_qkvz.weight,
+            )
+            bind(
+                layer_idx,
+                "GDN_INPUT_BA",
+                mixer.in_proj_ba.weight,
+            )
             bind(layer_idx, "GDN_CONV", mixer.conv1d.weight[:, 0, :])
             bind(layer_idx, "GDN_A_LOG", mixer.A_log)
             bind(layer_idx, "GDN_DT_BIAS", mixer.dt_bias)
@@ -54,21 +70,37 @@ def build_weight_bindings(model: Any, tapid: Any) -> list[Any]:
             q_gate, key, value = mixer.qkv_proj.weight.split(
                 [mixer.q_size * 2, mixer.kv_size, mixer.kv_size], dim=0
             )
-            bind(layer_idx, "NORM_SCALE", layer.input_layernorm.weight)
+            q_gate = q_gate.reshape(
+                mixer.num_heads,
+                2,
+                mixer.head_dim,
+                q_gate.shape[1],
+            )
+            q_gate = torch.cat((q_gate[:, 0], q_gate[:, 1]), dim=0)
+            q_gate = q_gate.reshape(mixer.q_size * 2, -1).contiguous()
+            bind(
+                layer_idx,
+                "NORM_SCALE",
+                qwen_rms_scale(layer.input_layernorm.weight),
+            )
             bind(layer_idx, "ATTN_Q", q_gate)
             bind(layer_idx, "ATTN_K", key)
             bind(layer_idx, "ATTN_V", value)
             bind(layer_idx, "ATTN_O", mixer.o_proj.weight)
-            bind(layer_idx, "ATTN_Q_NORM", mixer.q_norm.weight)
-            bind(layer_idx, "ATTN_K_NORM", mixer.k_norm.weight)
+            bind(layer_idx, "ATTN_Q_NORM", qwen_rms_scale(mixer.q_norm.weight))
+            bind(layer_idx, "ATTN_K_NORM", qwen_rms_scale(mixer.k_norm.weight))
 
         gate, up = layer.mlp.gate_up_proj.weight.chunk(2, dim=0)
-        bind(layer_idx, "MLP_NORM_SCALE", layer.post_attention_layernorm.weight)
+        bind(
+            layer_idx,
+            "MLP_NORM_SCALE",
+            qwen_rms_scale(layer.post_attention_layernorm.weight),
+        )
         bind(layer_idx, "MLP_GATE", gate)
         bind(layer_idx, "MLP_UP", up)
         bind(layer_idx, "MLP_DOWN", layer.mlp.down_proj.weight)
 
-    bind(None, "FINAL_NORM", text_model.norm.weight)
+    bind(None, "FINAL_NORM", qwen_rms_scale(text_model.norm.weight))
     return bindings
 
 
@@ -125,7 +157,7 @@ def build_prefill_step(
     hidden_output = runner.tapid_hidden_output
 
     assert hidden_output is not None
-    assert hidden_input.dtype == torch.bfloat16 and hidden_input.ndim == 2
+    assert hidden_input.dtype == torch.float32 and hidden_input.ndim == 2
     assert hidden_input.shape[1] == runner.model_config.get_hidden_size()
     assert positions.dtype == torch.int64 and positions.shape == (num_tokens,)
     assert query_start_loc.dtype == torch.int32
