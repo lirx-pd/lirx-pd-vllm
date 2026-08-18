@@ -126,31 +126,60 @@ def build_runtime_bindings(
     )
 
 
-def build_prefill_step(
+def build_forward_step(
     runner: Any,
     tapid: Any,
     attention_layer: str,
-    gdn_layer: str,
+    gdn_layers: tuple[str, ...],
     hidden_input: torch.Tensor,
     positions: torch.Tensor,
 ) -> Any:
     context = get_forward_context()
     assert isinstance(context.attn_metadata, dict)
     attention_metadata = context.attn_metadata[attention_layer]
-    gdn_metadata = context.attn_metadata[gdn_layer]
+    gdn_metadata = [context.attn_metadata[name] for name in gdn_layers]
+    if not gdn_metadata:
+        raise ValueError("TAPID requires GDN metadata")
 
-    if gdn_metadata.num_spec_decodes != 0:
-        raise ValueError("TAPID prefill does not support speculative decode")
+    state_rows: list[torch.Tensor] = []
+    layer_indices: list[int] = []
+    num_decode_requests = int(gdn_metadata[0].num_decodes)
+    for name, metadata in zip(gdn_layers, gdn_metadata, strict=True):
+        if metadata.num_spec_decodes != 0:
+            raise ValueError("TAPID does not support speculative decode")
+        if int(metadata.num_decodes) != num_decode_requests:
+            raise ValueError(
+                "TAPID received inconsistent per-layer GDN decode metadata"
+            )
+        indices = metadata.non_spec_state_indices_tensor
+        assert indices is not None
+        if state_rows and indices.shape != state_rows[0].shape:
+            raise ValueError("TAPID received inconsistent GDN state metadata")
+        state_rows.append(indices)
+        layer_indices.append(int(name.split(".layers.", 1)[1].split(".", 1)[0]))
 
-    state_indices = gdn_metadata.non_spec_state_indices_tensor
-    assert state_indices is not None
-    num_requests = state_indices.numel()
+    num_requests = state_rows[0].numel()
+    state_indices = state_rows[0].new_full((64, num_requests), -1)
+    state_indices.index_copy_(
+        0,
+        torch.tensor(layer_indices, device=state_indices.device, dtype=torch.int64),
+        torch.stack(state_rows),
+    )
     num_tokens = hidden_input.shape[0]
+    if num_decode_requests < 0 or num_decode_requests > num_requests:
+        raise ValueError("TAPID received inconsistent decode metadata")
+    if num_decode_requests and (
+        num_decode_requests != num_requests or num_requests != 1
+    ):
+        raise ValueError("TAPID decode currently supports only one decode request")
 
     num_computed_cpu = runner.input_batch.num_computed_tokens_cpu[:num_requests]
     num_prompt_cpu = runner.input_batch.num_prompt_tokens[:num_requests]
-    if not np.all(num_computed_cpu < num_prompt_cpu):
-        raise ValueError("TAPID prefill received a decode request")
+    if num_decode_requests:
+        if not np.all(num_computed_cpu >= num_prompt_cpu):
+            raise ValueError("TAPID decode metadata disagrees with request state")
+    elif not np.all(num_computed_cpu < num_prompt_cpu):
+        raise ValueError("TAPID prefill metadata disagrees with request state")
 
     query_start_loc = runner.query_start_loc.gpu[: num_requests + 1]
     num_computed_tokens = runner.num_computed_tokens[:num_requests]
@@ -165,10 +194,11 @@ def build_prefill_step(
     assert state_indices.dtype == torch.int32
     assert hidden_output.shape[0] >= num_tokens
 
-    return tapid.PrefillStep(
+    return tapid.ForwardStep(
         num_tokens=num_tokens,
         num_requests=num_requests,
         hidden_input=hidden_input,
+        num_decode_requests=num_decode_requests,
         positions=positions,
         query_start_loc=query_start_loc,
         num_computed_tokens=num_computed_tokens,
@@ -177,3 +207,6 @@ def build_prefill_step(
         attention_slot_mapping=attention_metadata.slot_mapping,
         gdn_state_indices=state_indices,
     )
+
+
+build_prefill_step = build_forward_step

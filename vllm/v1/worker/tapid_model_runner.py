@@ -12,7 +12,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.tapid_qwen3_5 import (
-    build_prefill_step,
+    build_forward_step,
     build_runtime_bindings,
     build_weight_bindings,
     get_qwen_layer_names,
@@ -128,14 +128,14 @@ class TapidGPUModelRunner(GPUModelRunner):
         **model_kwargs: dict[str, Any],
     ) -> Any:
         if positions is None:
-            raise self.tapid.TapidConfigError("TAPID P0/P1 requires positions")
+            raise self.tapid.TapidConfigError("TAPID forward requires positions")
         if inputs_embeds is not None:
             hidden_input = inputs_embeds.float()
         elif input_ids is not None:
             hidden_input = self.model.embed_input_ids(input_ids).float()
         else:
             raise self.tapid.TapidConfigError(
-                "TAPID P0/P1 requires token IDs or input embeddings"
+                "TAPID forward requires token IDs or input embeddings"
             )
 
         if positions.dim() == 2:
@@ -147,36 +147,55 @@ class TapidGPUModelRunner(GPUModelRunner):
             positions = positions[0]
         if self.tapid_session is None:
             self.tapid_session = self._new_tapid_session(bind_runtime=True)
-        step = build_prefill_step(
+        step = build_forward_step(
             self,
             self.tapid,
             self.tapid_attention_layers[0],
-            self.tapid_gdn_layers[0],
+            self.tapid_gdn_layers,
             hidden_input,
             positions,
         )
-        if self.tapid_config.get("trace_prefill_batches", False):
+        trace_forward = self.tapid_config.get(
+            "trace_forward_batches",
+            self.tapid_config.get("trace_prefill_batches", False),
+        )
+        if trace_forward:
+            phase = "decode" if step.num_decode_requests else "prefill"
             logger.info(
-                "TAPID prefill submission: num_requests=%d num_tokens=%d",
+                "TAPID forward submission: phase=%s num_requests=%d num_tokens=%d",
+                phase,
                 step.num_requests,
                 step.num_tokens,
             )
+            active_blocks = (
+                int(step.positions.max().item()) // (self.cache_config.block_size) + 1
+            )
+            logger.info(
+                "TAPID forward metadata: positions=%s query_start=%s "
+                "computed=%s gdn_state_shape=%s slots=%s blocks=%s",
+                step.positions.tolist(),
+                step.query_start_loc.tolist(),
+                step.num_computed_tokens.tolist(),
+                tuple(step.gdn_state_indices.shape),
+                step.attention_slot_mapping.tolist(),
+                step.attention_block_table[
+                    : step.num_requests, :active_blocks
+                ].tolist(),
+            )
         stream = torch.cuda.current_stream(self.device)
         session = self.tapid_session
-        try:
-            session.start()
-            output = session.run_prefill(step, stream=stream)
-            # The persistent TAPID daemon must stop before vLLM launches its
-            # native logits and sampler kernels on the same GPU.
-            stream.synchronize()
-            return output.to(self.model_config.dtype)
-        finally:
-            session.close()
-            self.tapid_session = None
+        session.start()
+        output = session.run_forward(step, stream=stream)
+        # Preserve the Session and its epoch/state across prefill and decode,
+        # while yielding the GPU to vLLM logits and sampling between steps.
+        stream.synchronize()
+        session.pause()
+        return output.to(self.model_config.dtype)
 
     def shutdown(self) -> None:
         if self.tapid_session is not None:
             self.tapid_session.close()
+            self.tapid_session = None
         self.tapid_weight_bindings.clear()
         self.tapid_hidden_output = None
         super().shutdown()

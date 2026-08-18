@@ -59,9 +59,10 @@ class RuntimeBindings:
 
 
 @dataclass(frozen=True)
-class PrefillStep:
+class ForwardStep:
     num_tokens: int
     num_requests: int
+    num_decode_requests: int
     hidden_input: torch.Tensor
     positions: torch.Tensor
     query_start_loc: torch.Tensor
@@ -82,6 +83,10 @@ class FakeSession:
         self.workspace = None
         self.last_step = None
         self.last_stream = None
+        self.start_count = 0
+        self.run_count = 0
+        self.pause_count = 0
+        self.close_count = 0
 
     def bind_weights(self, weights):
         self.weights = weights
@@ -95,16 +100,24 @@ class FakeSession:
 
     def start(self):
         self.ready = True
+        self.start_count += 1
 
-    def run_prefill(self, step, *, stream=None):
+    def run_forward(self, step, *, stream=None):
         self.last_step = step
         self.last_stream = stream
+        self.run_count += 1
         return step.hidden_output[: step.num_tokens]
+
+    run_prefill = run_forward
+
+    def pause(self):
+        self.pause_count += 1
 
     def close(self):
         self.ready = False
         self.weights = None
         self.bindings = None
+        self.close_count += 1
 
 
 class FakeStream:
@@ -115,12 +128,16 @@ class FakeStream:
         self.synchronized = True
 
 
+PrefillStep = ForwardStep
+
+
 FAKE_TAPID = SimpleNamespace(
     Session=FakeSession,
     WeightRole=WeightRole,
     WeightBinding=WeightBinding,
     RuntimeBindings=RuntimeBindings,
-    PrefillStep=PrefillStep,
+    ForwardStep=ForwardStep,
+    PrefillStep=ForwardStep,
     TapidConfigError=TapidConfigError,
 )
 
@@ -304,16 +321,24 @@ def test_qwen_runtime_and_prefill_bindings(monkeypatch: pytest.MonkeyPatch):
     block_table = torch.tensor([[2], [3]], dtype=torch.int32)
     slot_mapping = torch.tensor([33, 34, 48], dtype=torch.int64)
     state_indices = torch.tensor([4, 5], dtype=torch.int32)
+    second_state_indices = torch.tensor([6, 7], dtype=torch.int32)
+    gdn_layer = "model.layers.0.linear_attn"
+    second_gdn_layer = "model.layers.1.linear_attn"
     context = SimpleNamespace(
         attn_metadata={
             "attention": SimpleNamespace(
                 block_table=block_table,
                 slot_mapping=slot_mapping,
             ),
-            "gdn": SimpleNamespace(
-                num_decodes=1,
+            gdn_layer: SimpleNamespace(
+                num_decodes=0,
                 num_spec_decodes=0,
                 non_spec_state_indices_tensor=state_indices,
+            ),
+            second_gdn_layer: SimpleNamespace(
+                num_decodes=0,
+                num_spec_decodes=0,
+                non_spec_state_indices_tensor=second_state_indices,
             ),
         }
     )
@@ -326,28 +351,94 @@ def test_qwen_runtime_and_prefill_bindings(monkeypatch: pytest.MonkeyPatch):
     runner.num_computed_tokens = num_computed_tokens
     runner.tapid_hidden_output = hidden_output
 
-    step = tapid_qwen_module.build_prefill_step(
+    step = tapid_qwen_module.build_forward_step(
         runner,
         FAKE_TAPID,
         "attention",
-        "gdn",
+        (gdn_layer, second_gdn_layer),
         hidden_input,
         positions,
     )
     assert step.num_tokens == 3
     assert step.num_requests == 2
-    assert step.gdn_state_indices is state_indices
+    assert step.num_decode_requests == 0
+    assert step.gdn_state_indices.shape == (64, 2)
+    assert torch.equal(step.gdn_state_indices[0], state_indices)
+    assert torch.equal(step.gdn_state_indices[1], second_state_indices)
     assert step.attention_block_table is block_table
 
     runner.input_batch.num_computed_tokens_cpu[1] = 8
-    with pytest.raises(ValueError, match="decode request"):
-        tapid_qwen_module.build_prefill_step(
+    with pytest.raises(ValueError, match="prefill metadata"):
+        tapid_qwen_module.build_forward_step(
             runner,
             FAKE_TAPID,
             "attention",
-            "gdn",
+            (gdn_layer, second_gdn_layer),
             hidden_input,
             positions,
+        )
+
+
+def test_qwen_builds_single_request_decode_step(monkeypatch: pytest.MonkeyPatch):
+    hidden_input = torch.empty(1, 5120, dtype=torch.float32)
+    positions = torch.tensor([8], dtype=torch.int64)
+    query_start_loc = torch.tensor([0, 1], dtype=torch.int32)
+    num_computed_tokens = torch.tensor([8], dtype=torch.int32)
+    hidden_output = torch.empty(8, 5120, dtype=torch.float32)
+    block_table = torch.tensor([[2]], dtype=torch.int32)
+    slot_mapping = torch.tensor([40], dtype=torch.int64)
+    state_indices = torch.tensor([4], dtype=torch.int32)
+    gdn_layer = "model.layers.0.linear_attn"
+    context = SimpleNamespace(
+        attn_metadata={
+            "attention": SimpleNamespace(
+                block_table=block_table,
+                slot_mapping=slot_mapping,
+            ),
+            gdn_layer: SimpleNamespace(
+                num_decodes=1,
+                num_spec_decodes=0,
+                non_spec_state_indices_tensor=state_indices,
+            ),
+        }
+    )
+    monkeypatch.setattr(tapid_qwen_module, "get_forward_context", lambda: context)
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            num_computed_tokens_cpu=np.array([8], dtype=np.int32),
+            num_prompt_tokens=np.array([8], dtype=np.int32),
+        ),
+        query_start_loc=SimpleNamespace(gpu=query_start_loc),
+        num_computed_tokens=num_computed_tokens,
+        tapid_hidden_output=hidden_output,
+        model_config=SimpleNamespace(get_hidden_size=lambda: 5120),
+    )
+
+    step = tapid_qwen_module.build_forward_step(
+        runner,
+        FAKE_TAPID,
+        "attention",
+        (gdn_layer,),
+        hidden_input,
+        positions,
+    )
+
+    assert step.num_tokens == 1
+    assert step.num_requests == 1
+    assert step.num_decode_requests == 1
+    assert torch.equal(step.num_computed_tokens, num_computed_tokens)
+    assert step.attention_block_table is block_table
+    assert step.attention_slot_mapping is slot_mapping
+    assert step.gdn_state_indices.shape == (64, 1)
+    assert torch.equal(step.gdn_state_indices[0], state_indices)
+
+    context.attn_metadata[gdn_layer].non_spec_state_indices_tensor = torch.tensor(
+        [4, 5], dtype=torch.int32
+    )
+    context.attn_metadata[gdn_layer].num_decodes = 2
+    with pytest.raises(ValueError, match="only one decode request"):
+        tapid_qwen_module.build_forward_step(
+            runner, FAKE_TAPID, "attention", (gdn_layer,), hidden_input, positions
         )
 
 
@@ -411,6 +502,7 @@ def test_tapid_runner_lifecycle_uses_session():
     step = PrefillStep(
         num_tokens=1,
         num_requests=1,
+        num_decode_requests=0,
         hidden_input=hidden_input,
         positions=torch.tensor([0], dtype=torch.int64),
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
@@ -424,7 +516,7 @@ def test_tapid_runner_lifecycle_uses_session():
     with (
         patch.object(
             tapid_runner_module,
-            "build_prefill_step",
+            "build_forward_step",
             return_value=step,
         ) as build_step,
         patch.object(torch.cuda, "current_stream", return_value=stream),
@@ -438,10 +530,30 @@ def test_tapid_runner_lifecycle_uses_session():
     assert session.last_step is step
     assert session.last_stream is stream
     assert stream.synchronized
-    assert runner.tapid_session is None
+    assert runner.tapid_session is session
     assert build_step.call_args.args[-1].shape == (1,)
+
+    with (
+        patch.object(
+            tapid_runner_module,
+            "build_forward_step",
+            return_value=step,
+        ),
+        patch.object(torch.cuda, "current_stream", return_value=stream),
+    ):
+        second_output = runner._model_forward(
+            torch.tensor([2], dtype=torch.int32), step.positions.repeat(3, 1)
+        )
+    assert second_output.shape == (1, 4)
+    assert runner.tapid_session is session
+    assert session.start_count == 2
+    assert session.run_count == 2
+    assert session.pause_count == 2
+    assert session.close_count == 0
 
     with patch.object(GPUModelRunner, "shutdown"):
         runner.shutdown()
     assert not session.ready
+    assert session.close_count == 1
+    assert runner.tapid_session is None
     assert runner.tapid_hidden_output is None
