@@ -118,6 +118,11 @@ class _TapidModelRunnerBase:
         self._probe_state_tensors = None
         self._probe_state_names = None
         self._probe_state_blocks = None
+        # Which engine actually ran each forward. TAPID takes prefill; decode
+        # stays on vLLM, so a healthy generation shows one TAPID step per
+        # request and one vLLM step per generated token.
+        self._tapid_steps = 0
+        self._vllm_steps = 0
 
     def _report_tapid_divergence(
         self, tapid_hidden: torch.Tensor, reference: torch.Tensor
@@ -423,7 +428,15 @@ class _TapidModelRunnerBase:
             return False
         if context.is_padding is not None and bool(context.is_padding.any()):
             return False
-        # P0: TAPID only owns pure-prefill steps.
+        # The GDN state write-back keys everything off request 0, and the scan
+        # does not reset at request boundaries, so a batch carrying more than
+        # one request would be silently wrong rather than merely unsupported.
+        indices = gdn_metadata.non_spec_state_indices_tensor
+        if indices is None or indices.numel() != 1:
+            return False
+        # TAPID owns pure-prefill steps only. Decode and mixed batches run on
+        # vLLM's own kernels -- TAPID's contribution to them is the KV / GDN
+        # state its prefill wrote, not the decode arithmetic itself.
         return gdn_metadata.num_decodes == 0 and gdn_metadata.num_spec_decodes == 0
 
     def _ensure_tapid_started(self) -> None:
@@ -587,6 +600,7 @@ class TapidGPUModelRunnerV2(_TapidModelRunnerBase, GPUModelRunnerV2):
         **model_kwargs: dict[str, Any],
     ) -> Any:
         if not self._tapid_owns_step():
+            self._vllm_steps += 1
             return super()._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -594,6 +608,11 @@ class TapidGPUModelRunnerV2(_TapidModelRunnerBase, GPUModelRunnerV2):
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        self._tapid_steps += 1
+        logger.info(
+            "TAPID owns this forward (prefill): tapid_steps=%d vllm_steps=%d",
+            self._tapid_steps, self._vllm_steps,
+        )
 
         context = get_forward_context()
         assert isinstance(context.attn_metadata, dict)

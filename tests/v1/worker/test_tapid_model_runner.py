@@ -627,7 +627,11 @@ def test_tapid_v2_runner_forward_routes_prefill_and_falls_back():
         gdn_state_index_by_layer=torch.full((64,), -1, dtype=torch.int32),
     )
     stream = object()
-    prefill_gdn = SimpleNamespace(num_decodes=0, num_spec_decodes=0)
+    prefill_gdn = SimpleNamespace(
+        num_decodes=0,
+        num_spec_decodes=0,
+        non_spec_state_indices_tensor=torch.tensor([1], dtype=torch.int32),
+    )
     prefill_context = SimpleNamespace(
         attn_metadata={"attention": object(), "gdn": prefill_gdn},
         is_padding=None,
@@ -659,7 +663,11 @@ def test_tapid_v2_runner_forward_routes_prefill_and_falls_back():
     assert runner.tapid_session.last_step is step
     assert runner.tapid_session.last_stream is stream
 
-    decode_gdn = SimpleNamespace(num_decodes=1, num_spec_decodes=0)
+    decode_gdn = SimpleNamespace(
+        num_decodes=1,
+        num_spec_decodes=0,
+        non_spec_state_indices_tensor=torch.tensor([1], dtype=torch.int32),
+    )
     decode_context = SimpleNamespace(
         attn_metadata={"attention": object(), "gdn": decode_gdn},
         is_padding=None,
@@ -705,7 +713,11 @@ def test_tapid_v2_runner_never_starts_kernels_before_warmup_completes():
     runner.tapid_gdn_layers = ("gdn",)
     runner.tapid_session = FakeSession(device=None, model_signature="qwen")
 
-    prefill_gdn = SimpleNamespace(num_decodes=0, num_spec_decodes=0)
+    prefill_gdn = SimpleNamespace(
+        num_decodes=0,
+        num_spec_decodes=0,
+        non_spec_state_indices_tensor=torch.tensor([1], dtype=torch.int32),
+    )
 
     def context(is_padding=None, metadata=None):
         return SimpleNamespace(
@@ -717,9 +729,21 @@ def test_tapid_v2_runner_never_starts_kernels_before_warmup_completes():
             is_padding=is_padding,
         )
 
+    multi_req = SimpleNamespace(
+        num_decodes=0,
+        num_spec_decodes=0,
+        non_spec_state_indices_tensor=torch.tensor([1, 2], dtype=torch.int32),
+    )
     cases = {
         # profile_run happens before initialize_kv_cache binds the runtime
         "runtime unbound": (False, False, context()),
+        # The GDN write-back keys off request 0 and the scan does not reset at
+        # request boundaries, so a multi-request batch must fall back rather
+        # than be silently wrong.
+        "multi request": (
+            True, True,
+            context(metadata={"attention": object(), "gdn": multi_req}),
+        ),
         # warmup runs real prefill steps, but TAPID is armed only after it
         "not armed": (True, False, context()),
         # dummy runs submit all-padding batches
