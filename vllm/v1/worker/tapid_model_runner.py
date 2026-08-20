@@ -451,9 +451,53 @@ class _TapidModelRunnerBase:
             return False
         return gdn_metadata.num_prefills + gdn_metadata.num_decodes > 0
 
+    def _warm_lazy_cuda_kernels(self) -> None:
+        """Force every embedding kernel vLLM may launch to load NOW.
+
+        ``CUDA_MODULE_LOADING`` defaults to LAZY, so a CUDA function's module is
+        loaded on its *first* launch. TAPID's persistent kernels never exit, so
+        a load that first happens after they go resident never completes:
+        ``cuLaunchKernel`` blocks inside the driver forever, and the engine
+        hangs with no error.
+
+        This was measured, not guessed. A 6-token prompt followed by a 35-token
+        one hung in ``F.embedding``'s ``index_select``; two prompts of the *same*
+        length were fine, and so were two long ones. The token count is what
+        picks the kernel specialisation, so only a length that had never been
+        embedded before could hang. vLLM's own warmup does not cover this,
+        because it does not embed token ids at a spread of lengths.
+
+        Sweeping the count here loads every specialisation up front.
+        ``CUDA_MODULE_LOADING=EAGER`` fixes it too, but it loads all of
+        libtorch_cuda's modules and costs minutes of startup.
+
+        ponytail: covers the embedding only. It is the one op whose shape still
+        varies per request after this point -- everything downstream of
+        _model_forward runs on num_reqs or fixed sizes. A future op that
+        dispatches on a new shape would need adding here.
+        """
+        embed = getattr(self.model, "embed_input_ids", None)
+        if embed is None:
+            return
+        max_tokens = int(self.scheduler_config.max_num_batched_tokens)
+        counts = {1, max_tokens}
+        n = 2
+        while n < max_tokens:
+            counts.add(n)
+            n *= 2
+        for count in sorted(counts):
+            # No sync afterwards: the lazy load happens inside the launch call
+            # itself -- that is exactly why cuLaunchKernel is where it blocks --
+            # so the module is resident once this returns.
+            embed(torch.zeros(count, dtype=torch.int32, device=self.device))
+        logger.info(
+            "TAPID: preloaded embedding kernels for %d token counts", len(counts)
+        )
+
     def _ensure_tapid_started(self) -> None:
         assert self.tapid_session is not None
         if not self.tapid_session.ready:
+            self._warm_lazy_cuda_kernels()
             _install_stream_only_sync(self.device)
             self.tapid_session.start()
 

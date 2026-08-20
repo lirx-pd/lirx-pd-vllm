@@ -751,6 +751,51 @@ def test_tapid_v2_runner_forward_routes_prefill_and_decode_and_falls_back():
     assert len(base_calls) == 2
 
 
+def test_tapid_preloads_embedding_kernels_before_kernels_go_resident():
+    """Lazy CUDA module loading must not be left to happen under the kernels.
+
+    CUDA_MODULE_LOADING defaults to LAZY, so a kernel's module loads on its
+    first launch, and TAPID's persistent kernels never exit -- a first launch
+    after they go resident blocks in cuLaunchKernel forever. Measured: a
+    6-token prompt then a 35-token one hung in F.embedding, while two prompts
+    of the same length were fine, because the token count picks the
+    specialisation. So the sweep has to cover a spread of counts, and all of it
+    has to land before start().
+    """
+    runner = TapidGPUModelRunnerV2.__new__(TapidGPUModelRunnerV2)
+    init_fake_tapid_state(runner)
+    runner.device = torch.device("cpu")
+    runner.tapid_session = FakeSession(device=None, model_signature="qwen")
+    runner.scheduler_config = SimpleNamespace(max_num_batched_tokens=256)
+
+    order: list[str] = []
+    embedded: list[int] = []
+
+    def fake_embed(ids):
+        order.append("embed")
+        embedded.append(int(ids.numel()))
+        return torch.zeros(ids.numel(), 4)
+
+    runner.model = SimpleNamespace(embed_input_ids=fake_embed)
+    original_start = runner.tapid_session.start
+
+    def tracking_start():
+        order.append("start")
+        original_start()
+
+    runner.tapid_session.start = tracking_start
+
+    runner._ensure_tapid_started()
+
+    assert order[-1] == "start", order
+    assert "embed" in order
+    # Both ends of the range, and enough between them to cross whatever
+    # threshold the index_select dispatch actually uses.
+    assert 1 in embedded and 256 in embedded
+    assert len(embedded) >= 4
+    assert runner.tapid_session.ready
+
+
 def test_tapid_v2_runner_never_starts_kernels_before_warmup_completes():
     """The persistent kernels must not go resident during vLLM warmup.
 
