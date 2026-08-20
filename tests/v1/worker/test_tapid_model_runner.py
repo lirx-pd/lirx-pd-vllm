@@ -481,6 +481,7 @@ def test_tapid_v2_prefill_step():
     )
     gdn_metadata = SimpleNamespace(
         num_spec_decodes=0,
+        num_prefills=1,
         num_decodes=0,
         non_spec_state_indices_tensor=state_indices,
     )
@@ -497,8 +498,11 @@ def test_tapid_v2_prefill_step():
     assert step.attention_block_table is block_table
     assert step.gdn_state_indices is state_indices
 
+    # Mixed batches are the rejected shape now: a pure-decode step builds the
+    # same way a prefill does, and num_computed_tokens is what tells the mixers
+    # to continue from the caches rather than start at position 0.
     gdn_metadata.num_decodes = 1
-    with pytest.raises(ValueError, match="decode"):
+    with pytest.raises(ValueError, match="mixed"):
         tapid_qwen_module.build_v2_prefill_step(
             runner,
             FAKE_TAPID,
@@ -508,6 +512,17 @@ def test_tapid_v2_prefill_step():
             positions,
             torch.full((64,), -1, dtype=torch.int32),
         )
+    gdn_metadata.num_prefills = 0
+    decode_step = tapid_qwen_module.build_v2_prefill_step(
+        runner,
+        FAKE_TAPID,
+        attention_metadata,
+        gdn_metadata,
+        hidden_input,
+        positions,
+        torch.full((64,), -1, dtype=torch.int32),
+    )
+    assert decode_step.num_tokens == 3
 
 
 def test_tapid_v2_prefill_step_uses_block_table_tensor_fallback():
@@ -527,6 +542,7 @@ def test_tapid_v2_prefill_step_uses_block_table_tensor_fallback():
     )
     gdn_metadata = SimpleNamespace(
         num_spec_decodes=0,
+        num_prefills=1,
         num_decodes=0,
         non_spec_state_indices_tensor=state_indices,
     )
@@ -598,7 +614,7 @@ def test_tapid_v2_runner_lifecycle_uses_session():
     assert not session.ready
 
 
-def test_tapid_v2_runner_forward_routes_prefill_and_falls_back():
+def test_tapid_v2_runner_forward_routes_prefill_and_decode_and_falls_back():
     runner = TapidGPUModelRunnerV2.__new__(TapidGPUModelRunnerV2)
     init_fake_tapid_state(runner)
     runner.device = torch.device("cpu")
@@ -628,8 +644,27 @@ def test_tapid_v2_runner_forward_routes_prefill_and_falls_back():
     )
     stream = object()
     prefill_gdn = SimpleNamespace(
+        num_prefills=1,
         num_decodes=0,
         num_spec_decodes=0,
+        non_spec_state_indices_tensor=torch.tensor([1], dtype=torch.int32),
+    )
+    decode_gdn = SimpleNamespace(
+        num_prefills=0,
+        num_decodes=1,
+        num_spec_decodes=0,
+        non_spec_state_indices_tensor=torch.tensor([1], dtype=torch.int32),
+    )
+    mixed_gdn = SimpleNamespace(
+        num_prefills=1,
+        num_decodes=1,
+        num_spec_decodes=0,
+        non_spec_state_indices_tensor=torch.tensor([1], dtype=torch.int32),
+    )
+    spec_gdn = SimpleNamespace(
+        num_prefills=0,
+        num_decodes=0,
+        num_spec_decodes=1,
         non_spec_state_indices_tensor=torch.tensor([1], dtype=torch.int32),
     )
     prefill_context = SimpleNamespace(
@@ -663,22 +698,11 @@ def test_tapid_v2_runner_forward_routes_prefill_and_falls_back():
     assert runner.tapid_session.last_step is step
     assert runner.tapid_session.last_stream is stream
 
-    decode_gdn = SimpleNamespace(
-        num_decodes=1,
-        num_spec_decodes=0,
-        non_spec_state_indices_tensor=torch.tensor([1], dtype=torch.int32),
-    )
+    # A pure-decode step is TAPID's too: same traversal, one row.
     decode_context = SimpleNamespace(
         attn_metadata={"attention": object(), "gdn": decode_gdn},
         is_padding=None,
     )
-    sentinel = object()
-    base_calls = []
-
-    def fake_base_forward(self, **kwargs):
-        base_calls.append(kwargs)
-        return sentinel
-
     with (
         patch.object(
             tapid_runner_module,
@@ -686,16 +710,45 @@ def test_tapid_v2_runner_forward_routes_prefill_and_falls_back():
             return_value=decode_context,
         ),
         patch.object(
-            tapid_runner_module.GPUModelRunnerV2,
-            "_model_forward",
-            new=fake_base_forward,
+            tapid_runner_module, "build_v2_prefill_step", return_value=step
         ),
+        patch.object(torch.cuda, "current_stream", return_value=stream),
     ):
         output = runner._model_forward(
             torch.tensor([1], dtype=torch.int32), step.positions
         )
-    assert output is sentinel
-    assert len(base_calls) == 1
+    assert output.data_ptr() == runner.tapid_hidden_output.data_ptr()
+
+    # Mixed and speculative batches still fall back to vLLM's kernels.
+    sentinel = object()
+    base_calls = []
+
+    def fake_base_forward(self, **kwargs):
+        base_calls.append(kwargs)
+        return sentinel
+
+    for gdn in (mixed_gdn, spec_gdn):
+        fallback_context = SimpleNamespace(
+            attn_metadata={"attention": object(), "gdn": gdn},
+            is_padding=None,
+        )
+        with (
+            patch.object(
+                tapid_runner_module,
+                "get_forward_context",
+                return_value=fallback_context,
+            ),
+            patch.object(
+                tapid_runner_module.GPUModelRunnerV2,
+                "_model_forward",
+                new=fake_base_forward,
+            ),
+        ):
+            output = runner._model_forward(
+                torch.tensor([1], dtype=torch.int32), step.positions
+            )
+        assert output is sentinel
+    assert len(base_calls) == 2
 
 
 def test_tapid_v2_runner_never_starts_kernels_before_warmup_completes():
@@ -703,8 +756,8 @@ def test_tapid_v2_runner_never_starts_kernels_before_warmup_completes():
 
     Warmup and memory profiling are full of device-wide syncs, and once
     TAPID's kernels are running they never return, so any such sync deadlocks
-    the worker. Only a fully bound, armed, non-padding, pure-prefill step may
-    reach ``start()``.
+    the worker. Only a fully bound, armed, non-padding, single-request step
+    that is purely prefill or purely decode may reach ``start()``.
     """
     runner = TapidGPUModelRunnerV2.__new__(TapidGPUModelRunnerV2)
     init_fake_tapid_state(runner)
@@ -714,8 +767,27 @@ def test_tapid_v2_runner_never_starts_kernels_before_warmup_completes():
     runner.tapid_session = FakeSession(device=None, model_signature="qwen")
 
     prefill_gdn = SimpleNamespace(
+        num_prefills=1,
         num_decodes=0,
         num_spec_decodes=0,
+        non_spec_state_indices_tensor=torch.tensor([1], dtype=torch.int32),
+    )
+    decode_gdn = SimpleNamespace(
+        num_prefills=0,
+        num_decodes=1,
+        num_spec_decodes=0,
+        non_spec_state_indices_tensor=torch.tensor([1], dtype=torch.int32),
+    )
+    mixed_gdn = SimpleNamespace(
+        num_prefills=1,
+        num_decodes=1,
+        num_spec_decodes=0,
+        non_spec_state_indices_tensor=torch.tensor([1], dtype=torch.int32),
+    )
+    spec_gdn = SimpleNamespace(
+        num_prefills=0,
+        num_decodes=0,
+        num_spec_decodes=1,
         non_spec_state_indices_tensor=torch.tensor([1], dtype=torch.int32),
     )
 
@@ -730,6 +802,7 @@ def test_tapid_v2_runner_never_starts_kernels_before_warmup_completes():
         )
 
     multi_req = SimpleNamespace(
+        num_prefills=2,
         num_decodes=0,
         num_spec_decodes=0,
         non_spec_state_indices_tensor=torch.tensor([1, 2], dtype=torch.int32),
@@ -750,6 +823,16 @@ def test_tapid_v2_runner_never_starts_kernels_before_warmup_completes():
         "padding batch": (True, True, context(is_padding=torch.tensor([True]))),
         # attention metadata is absent until the KV cache groups exist
         "no metadata": (True, True, context(metadata={})),
+        # one traversal cannot carry both shapes, and the write-backs still key
+        # off request 0
+        "mixed batch": (
+            True, True,
+            context(metadata={"attention": object(), "gdn": mixed_gdn}),
+        ),
+        "spec decode": (
+            True, True,
+            context(metadata={"attention": object(), "gdn": spec_gdn}),
+        ),
     }
     for label, (bound, armed, forward_context) in cases.items():
         runner.tapid_runtime_bound = bound
@@ -762,7 +845,24 @@ def test_tapid_v2_runner_never_starts_kernels_before_warmup_completes():
 
     runner.tapid_runtime_bound = True
     runner.tapid_arm()
-    with patch.object(
-        tapid_runner_module, "get_forward_context", return_value=context()
+    for label, metadata in (
+        ("prefill", None),
+        ("decode", {"attention": object(), "gdn": decode_gdn}),
     ):
-        assert runner._tapid_owns_step()
+        with patch.object(
+            tapid_runner_module,
+            "get_forward_context",
+            return_value=context(metadata=metadata),
+        ):
+            assert runner._tapid_owns_step(), label
+
+    # Verify mode returns vLLM's result after re-running the step, which would
+    # advance the GDN recurrence a second time on a decode.
+    runner.tapid_verify = True
+    with patch.object(
+        tapid_runner_module,
+        "get_forward_context",
+        return_value=context(metadata={"attention": object(), "gdn": decode_gdn}),
+    ):
+        assert not runner._tapid_owns_step()
+    runner.tapid_verify = False

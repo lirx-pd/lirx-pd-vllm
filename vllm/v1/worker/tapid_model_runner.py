@@ -406,12 +406,15 @@ class _TapidModelRunnerBase:
         self.tapid_runtime_bound = True
 
     def _tapid_owns_step(self) -> bool:
-        """True when this forward is a pure-prefill step TAPID can run.
+        """True when this forward is a step TAPID can run.
 
-        Everything else — profiling/dummy runs before ``bind_runtime``,
-        all-padding batches, decode and mixed batches — stays on the vLLM
-        model. The check must run *before* ``_ensure_tapid_started`` so the
-        persistent kernels are never launched for a step vLLM will execute.
+        Pure prefill and pure decode both qualify: they are the same 129-step
+        traversal, differing only in how many rows enter it and whether the
+        mixers seed themselves from the caches. Everything else — profiling /
+        dummy runs before ``bind_runtime``, all-padding batches, mixed
+        prefill+decode batches, spec decode — stays on the vLLM model. The
+        check must run *before* ``_ensure_tapid_started`` so the persistent
+        kernels are never launched for a step vLLM will execute.
         """
         if (
             self.tapid_session is None
@@ -434,10 +437,19 @@ class _TapidModelRunnerBase:
         indices = gdn_metadata.non_spec_state_indices_tensor
         if indices is None or indices.numel() != 1:
             return False
-        # TAPID owns pure-prefill steps only. Decode and mixed batches run on
-        # vLLM's own kernels -- TAPID's contribution to them is the KV / GDN
-        # state its prefill wrote, not the decode arithmetic itself.
-        return gdn_metadata.num_decodes == 0 and gdn_metadata.num_spec_decodes == 0
+        if gdn_metadata.num_spec_decodes != 0:
+            return False
+        # A mixed batch would need both shapes in one traversal, and the
+        # write-backs still key off request 0, so it stays on vLLM.
+        if gdn_metadata.num_prefills != 0 and gdn_metadata.num_decodes != 0:
+            return False
+        # Verify mode re-runs the step on vLLM and returns vLLM's result. For a
+        # prefill that is harmless (both write the same slots), but a decode
+        # would advance the GDN recurrence twice. Compare decode with
+        # cmp_tokens.py instead.
+        if self.tapid_verify and gdn_metadata.num_decodes != 0:
+            return False
+        return gdn_metadata.num_prefills + gdn_metadata.num_decodes > 0
 
     def _ensure_tapid_started(self) -> None:
         assert self.tapid_session is not None
@@ -609,15 +621,15 @@ class TapidGPUModelRunnerV2(_TapidModelRunnerBase, GPUModelRunnerV2):
                 **model_kwargs,
             )
         self._tapid_steps += 1
-        logger.info(
-            "TAPID owns this forward (prefill): tapid_steps=%d vllm_steps=%d",
-            self._tapid_steps, self._vllm_steps,
-        )
-
         context = get_forward_context()
         assert isinstance(context.attn_metadata, dict)
         attention_metadata = context.attn_metadata[self.tapid_attention_layers[0]]
         gdn_metadata = context.attn_metadata[self.tapid_gdn_layers[0]]
+        logger.info(
+            "TAPID owns this forward (%s): tapid_steps=%d vllm_steps=%d",
+            "decode" if gdn_metadata.num_decodes else "prefill",
+            self._tapid_steps, self._vllm_steps,
+        )
 
         model_inputs = {
             "input_ids": input_ids,
@@ -683,7 +695,11 @@ class TapidGPUModelRunnerV2(_TapidModelRunnerBase, GPUModelRunnerV2):
             self._report_tapid_state_divergence()
             return reference
 
-        if self.tapid_state_audit:
+        # Prefill only: the audit re-runs the same step on vLLM to get a
+        # reference, which for decode would advance state TAPID has already
+        # advanced and compare a step against its own successor. Token equality
+        # (cmp_tokens.py) is the decode-side check.
+        if self.tapid_state_audit and not gdn_metadata.num_decodes:
             stream.synchronize()
             tapid_state = self._audit_tapid_state(attention_metadata, gdn_metadata)
             blocks = sorted({int(v) // self.cache_config.block_size

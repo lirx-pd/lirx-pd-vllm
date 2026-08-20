@@ -267,9 +267,9 @@ def build_v2_prefill_step(
 ) -> Any:
     """Build a TAPID prefill step from V2 forward-context metadata."""
     if gdn_metadata.num_spec_decodes != 0:
-        raise ValueError("TAPID prefill does not support speculative decode")
-    if gdn_metadata.num_decodes != 0:
-        raise ValueError("TAPID prefill does not support decode or mixed batches")
+        raise ValueError("TAPID does not support speculative decode")
+    if gdn_metadata.num_prefills != 0 and gdn_metadata.num_decodes != 0:
+        raise ValueError("TAPID does not support mixed prefill+decode batches")
 
     state_indices = gdn_metadata.non_spec_state_indices_tensor
     assert state_indices is not None
